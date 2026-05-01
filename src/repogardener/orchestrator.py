@@ -1,4 +1,8 @@
-"""Pipeline orchestrator — wire scanner → analyzer → generator → publisher into one run."""
+"""Pipeline orchestrator — wire scanner → analyzer → generator → publisher into one run.
+
+State-aware: every field change is checked against a persistent ledger before
+applying, preventing redundant edits or overwriting user-made changes.
+"""
 
 from pathlib import Path
 
@@ -10,6 +14,9 @@ from repogardener.generators import generate_description, generate_topics, gener
 from repogardener.stale import find_stale_deps
 from repogardener.report import generate_report
 from repogardener.publisher import update_repo, upsert_readme
+from repogardener.state import StateTracker
+
+DEFAULT_STATE_FILE = Path("data/state.json")
 
 
 def run_pipeline(
@@ -17,6 +24,7 @@ def run_pipeline(
     dry_run: bool = True,
     workspace: Path | None = None,
     skip_clone: bool = False,
+    state_file: Path | None = DEFAULT_STATE_FILE,
 ) -> tuple[list[dict], str]:
     """Run the full RepoGardener pipeline.
 
@@ -25,12 +33,14 @@ def run_pipeline(
         dry_run: If True, only analyze and report; don't push to GitHub.
         workspace: Directory to clone repos into (optional, needed for analysis).
         skip_clone: If True, assume repos are already cloned in workspace.
+        state_file: Path to state.json ledger for preventing repeated edits.
 
     Returns:
         Tuple of (list of action dicts, markdown report string).
     """
     client = GithubClient()
     llm = LLMClient()  # uses defaults from llm.py
+    tracker = StateTracker(state_file)
 
     # 1. Scan
     print(f"🔍 Scanning repos for {username}...")
@@ -48,16 +58,19 @@ def run_pipeline(
 
     # 3. Analyze & Generate per repo
     results: list[dict] = []
+    skipped_state: list[str] = []
     for repo in repos:
         name = repo["name"]
         full_name = repo["full_name"]
         repo_dir = workspace / name if workspace else None
+        cur_desc = repo.get("description") or ""
+        cur_topics = repo.get("topics", [])
 
         result: dict = {
             "name": name,
             "full_name": full_name,
             "current_description": repo.get("description"),
-            "current_topics": repo.get("topics", []),
+            "current_topics": cur_topics,
             "has_changes": False,
         }
 
@@ -70,28 +83,42 @@ def run_pipeline(
             deps = parse_dependencies(repo_dir)
             result["deps"] = deps
 
-            # Generate description (if missing or very short)
-            cur_desc = repo.get("description") or ""
+            # ── Description ──────────────────────────────────────
             if not cur_desc or len(cur_desc) < 5:
-                try:
-                    new_desc = generate_description(llm, name, docs, pt["languages"], deps)
-                    result["new_description"] = new_desc
-                    result["has_changes"] = True
-                except Exception as e:
-                    print(f"   ⚠️  description gen failed for {name}: {e}")
+                ok, reason = tracker.should_apply(name, "description", cur_desc or None, "")
+                if ok:
+                    try:
+                        new_desc = generate_description(
+                            llm, name, docs, pt["languages"], deps
+                        )
+                        result["new_description"] = new_desc
+                        result["has_changes"] = True
+                        print(f"   📝 {name}: description {reason}")
+                    except Exception as e:
+                        print(f"   ⚠️  description gen failed for {name}: {e}")
+                else:
+                    skipped_state.append(f"description({name}): {reason}")
+                    print(f"   ⏭️  {name}: description skipped ({reason})")
 
-            # Generate topics (if missing)
-            if not repo.get("topics"):
-                try:
-                    new_topics = generate_topics(
-                        llm, name, result.get("new_description", ""), pt["languages"], deps
-                    )
-                    result["new_topics"] = new_topics
-                    result["has_changes"] = True
-                except Exception as e:
-                    print(f"   ⚠️  topics gen failed for {name}: {e}")
+            # ── Topics ───────────────────────────────────────────
+            if not cur_topics:
+                ok, reason = tracker.should_apply(name, "topics", None, "")
+                if ok:
+                    try:
+                        new_topics = generate_topics(
+                            llm, name, result.get("new_description", cur_desc),
+                            pt["languages"], deps
+                        )
+                        result["new_topics"] = new_topics
+                        result["has_changes"] = True
+                        print(f"   🏷️  {name}: topics {reason}")
+                    except Exception as e:
+                        print(f"   ⚠️  topics gen failed for {name}: {e}")
+                else:
+                    skipped_state.append(f"topics({name}): {reason}")
+                    print(f"   ⏭️  {name}: topics skipped ({reason})")
 
-            # Stale deps
+            # ── Stale deps (always fresh, not state-tracked) ─────
             try:
                 stale = find_stale_deps(deps.get("runtime", []))
                 if stale:
@@ -100,18 +127,28 @@ def run_pipeline(
             except Exception as e:
                 print(f"   ⚠️  stale check failed for {name}: {e}")
 
-            # README — only generate if missing and project has substance
+            # ── README ───────────────────────────────────────────
             if not pt["has_readme"] and (docs or deps.get("runtime")):
-                try:
-                    readme = generate_readme(
-                        llm, name, docs, pt["languages"], deps, result.get("new_topics", [])
-                    )
-                    result["new_readme"] = readme
-                    result["has_changes"] = True
-                except Exception as e:
-                    print(f"   ⚠️  README gen failed for {name}: {e}")
+                ok, reason = tracker.should_apply(name, "readme", None, "")
+                if ok:
+                    try:
+                        readme = generate_readme(
+                            llm, name, docs, pt["languages"], deps,
+                            result.get("new_topics", [])
+                        )
+                        result["new_readme"] = readme
+                        result["has_changes"] = True
+                        print(f"   📖 {name}: README {reason}")
+                    except Exception as e:
+                        print(f"   ⚠️  README gen failed for {name}: {e}")
+                else:
+                    skipped_state.append(f"readme({name}): {reason}")
+                    print(f"   ⏭️  {name}: README skipped ({reason})")
 
         results.append(result)
+
+    # ── State summary ───────────────────────────────────────────
+    print(f"\n📊 State ledger: {len(tracker.get_summary())} repos tracked")
 
     # 4. Generate report
     report_text = generate_report(results)
@@ -123,6 +160,7 @@ def run_pipeline(
         for r in results:
             if not r["has_changes"]:
                 continue
+            name = r["name"]
             # Need at least description or topics to update
             desc = r.get("new_description")
             topics = r.get("new_topics")
@@ -130,11 +168,20 @@ def run_pipeline(
                 ok = update_repo(client, r["full_name"], description=desc, topics=topics)
                 if not ok:
                     continue
+                # Mark state
+                if desc:
+                    tracker.mark_applied(name, "description", desc)
+                if topics:
+                    tracker.mark_applied(name, "topics", ", ".join(sorted(topics)))
             # README
-            if r.get("new_readme"):
-                upsert_readme(client, r["full_name"], r["new_readme"])
+            readme = r.get("new_readme")
+            if readme:
+                upsert_readme(client, r["full_name"], readme)
+                tracker.mark_applied(name, "readme", readme)
             updated += 1
+        tracker.save()
         print(f"   Applied changes to {updated} repos.")
+        print(f"   State saved to {tracker.state_file}")
 
     print(f"✅ {'Dry-run' if dry_run else 'Run'} complete.")
     return results, report_text

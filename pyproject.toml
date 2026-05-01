@@ -1,0 +1,31 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "repogardener"
+version = "0.1.0"
+description = "Automated GitHub profile gardening — descriptions, topics, READMEs, stale deps"
+requires-python = ">=3.11"
+dependencies = [
+    "click>=8.1",
+    "pyyaml>=6.0",
+    "python-dotenv>=1.0",
+    "libcst>=1.4",
+    "gitpython>=3.1",
+]
+readme = "README.md"
+license = {text = "MIT"}
+
+[project.scripts]
+repogardener = "repogardener.cli:main"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=5.0",
+    "ruff>=0.5",
+]
+llm = [
+    "httpx>=0.28",
+]
